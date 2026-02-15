@@ -10,7 +10,22 @@ from datetime import datetime
 # ============================================================
 TOKEN = "8400929450:AAGt6tfY3cBT18pSTOkBLGViTL4aQpZWm5c"
 CHAT_ID = "5408858173" 
-SYMBOL = "GC=F" # Gold Futures
+
+# Assets with natural Bullish Bias
+SYMBOLS = {
+    'GC=F': 'GOLD',
+    'ES=F': 'S&P 500',
+    'SI=F': 'SILVER'
+}
+
+CONFIG = {
+    'rr': 4.0,
+    'trailing_trigger': 1.5,
+    'trailing_stop_level': -0.75,
+    'min_adx': 25,
+    'killzone_hours': [14, 15],
+    'risk_per_trade': 100.0 # Fixed $100 risk for your OFP account
+}
 
 def send_telegram_msg(message):
     try:
@@ -20,105 +35,92 @@ def send_telegram_msg(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def get_signals():
-    # 1. FETCH DATA (15 days ensures indicators are ready)
-    df_15m = yf.download(SYMBOL, period="15d", interval="15m", progress=False)
+def get_data_and_context(symbol):
+    df_15m = yf.download(symbol, period="15d", interval="15m", progress=False)
+    if df_15m.empty: return None, None
     if isinstance(df_15m.columns, pd.MultiIndex):
         df_15m.columns = df_15m.columns.get_level_values(0)
 
-    # 2. CALCULATE INDICATORS (Identical logic to Audit)
-    # SMA 800
+    # SMA 800 & ADX
     df_15m['sma'] = df_15m['Close'].rolling(800).mean()
-    
-    # ADX 14 (Vectorized for speed, identical math)
     h, l, c = df_15m['High'].values, df_15m['Low'].values, df_15m['Close'].values
     up = np.zeros_like(h); down = np.zeros_like(l)
     up[1:] = h[1:] - h[:-1]; down[1:] = l[:-1] - l[1:]
-    plus_dm = np.where((up > down) & (up > 0), up, 0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0)
+    p_dm = np.where((up > down) & (up > 0), up, 0); m_dm = np.where((down > up) & (down > 0), down, 0)
     tr = np.maximum(h[1:] - l[1:], np.maximum(abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])))
     tr = np.insert(tr, 0, h[0]-l[0])
     tr_s = pd.Series(tr).rolling(14).mean().values
-    p_di = 100 * (pd.Series(plus_dm).rolling(14).mean().values / (tr_s + 0.001))
-    m_di = 100 * (pd.Series(minus_dm).rolling(14).mean().values / (tr_s + 0.001))
-    dx = (abs(p_di - m_di) / (p_di + m_di + 0.001)) * 100
-    df_15m['adx'] = pd.Series(dx).rolling(14).mean().values
+    p_di = 100 * (pd.Series(p_dm).rolling(14).mean().values / (tr_s + 0.001))
+    m_di = 100 * (pd.Series(m_dm).rolling(14).mean().values / (tr_s + 0.001))
+    df_15m['adx'] = pd.Series((abs(p_di - m_di) / (p_di + m_di + 0.001)) * 100).rolling(14).mean().values
 
-    # 3. DAILY CONTEXT (Quiet Day + Bullish Bias)
+    # Daily Context
     df_d = df_15m.resample('D').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
     rng = (df_d['High'] - df_d['Low']).values
     df_d['vol_exp'] = rng > pd.Series(rng).rolling(5).mean().shift(1).values
     df_d['bias_bull'] = df_d['Close'] > df_d['High'].shift(1)
     ctx = {d.date(): {'vol': row['vol_exp'], 'bias': row['bias_bull']} for d, row in df_d.iterrows()}
     
-    # 4. TRAP GEOMETRY
+    # Structure
     df_15m['bear_fvg'] = df_15m['Low'].shift(2) > df_15m['High']
     df_15m['swing_high'] = (df_15m['High'].shift(1) > df_15m['High'].shift(2)) & (df_15m['High'].shift(1) > df_15m['High'])
     
     return df_15m, ctx
 
 def monitor():
-    print(f"🛰️ BigDave Sniper Scanner Online...")
+    print(f"🛰️ BigDave Multi-Asset Scanner Live...")
+    send_telegram_msg("🚀 *BigDave Sniper Online*\nMonitoring: Gold, S&P 500, Silver\nMode: Elite Sniper (Buy Only)\n*Status:* Hunting Traps...")
     
-    # --- STARTUP CHECK ---
-    send_telegram_msg("🚀 *BigDave Sniper Online*\n\nLogic: Elite Trap (RF 13.7)\nAsset: Gold (GC=F)\nFilters: SMA + ADX + Bias + QuietDay\n\n*Status:* Monitoring 24/7...")
-    
-    last_alert_bar = None
+    last_alerts = {s: None for s in SYMBOLS.keys()}
     last_heartbeat_day = -1 
     
     while True:
         try:
-            now = datetime.now()
-            
-            # --- DAILY HEARTBEAT ---
-            if now.day != last_heartbeat_day:
-                send_telegram_msg("❤️ *Heartbeat:* System is active and hunting.")
-                last_heartbeat_day = now.day
+            if datetime.now().day != last_heartbeat_day:
+                send_telegram_msg("❤️ *Daily Heartbeat:* System is healthy.")
+                last_heartbeat_day = datetime.now().day
 
-            df, ctx = get_signals()
-            last_bar = df.iloc[-1]
-            current_time = df.index[-1]
-            
-            # THE PILLARS OF THE EDGE
-            # 1. Regime & Momentum
-            if last_bar['Close'] > last_bar['sma'] and last_bar['adx'] > 25:
+            for sym, name in SYMBOLS.items():
+                df, ctx = get_data_and_context(sym)
+                if df is None: continue
                 
-                # 2. Daily Context
-                today_ctx = ctx.get(current_time.date())
-                if today_ctx and today_ctx['bias'] and not today_ctx['vol']:
-                    
-                    # 3. Structural Setup (FVG in last 3 bars)
-                    if df.iloc[-4:-1]['bear_fvg'].any():
-                        
-                        # 4. Trigger (Break of 12-candle Swing High)
-                        swing_high = df['High'].iloc[-13:-1].max()
-                        
-                        if last_bar['Close'] > swing_high:
-                            if last_alert_bar != current_time:
-                                # Trade Calculation
-                                fvg_low = df['Low'].iloc[-2] # Low of the FVG candle
-                                risk = last_bar['Close'] - fvg_low
-                                
-                                if risk > 0:
-                                    tp = last_bar['Close'] + (risk * 4.0)
-                                    lots = round(100.0 / (risk * 100), 2)
+                last_bar = df.iloc[-1]
+                t = df.index[-1]
+                
+                if t.hour in CONFIG['killzone_hours']: continue
+                
+                # PILLARS
+                if last_bar['Close'] > last_bar['sma'] and last_bar['adx'] > 25:
+                    today_ctx = ctx.get(t.date())
+                    if today_ctx and today_ctx['bias'] and not today_ctx['vol']:
+                        if df.iloc[-4:-1]['bear_fvg'].any():
+                            swing_high = df['High'].iloc[-13:-1].max()
+                            
+                            if last_bar['Close'] > swing_high:
+                                if last_alerts[sym] != t:
+                                    sl = df['Low'].iloc[-2]
+                                    risk = last_bar['Close'] - sl
+                                    if risk <= 0: continue
                                     
-                                    msg = (f"🚨 *ELITE GOLD TRAP DETECTED!*\n\n"
-                                           f"*Type:* BUY MARKET (Gold)\n"
-                                           f"*Position:* {lots} Lots\n"
+                                    tp = last_bar['Close'] + (risk * 4.0)
+                                    # Lot calculation based on Asset type
+                                    # (This is an approximation, always verify in your app)
+                                    lots = round(100.0 / (risk * 100), 2) if 'F' in sym else 1.0
+                                    
+                                    msg = (f"🚨 *ELITE {name} TRAP DETECTED!*\n\n"
                                            f"*Entry Around:* {last_bar['Close']:.2f}\n"
-                                           f"*Stop Loss:* {fvg_low:.2f}\n"
-                                           f"*Take Profit:* {tp:.2f}\n\n"
+                                           f"*Stop Loss:* {sl:.2f}\n"
+                                           f"*Take Profit:* {tp:.2f}\n"
+                                           f"*Position:* {lots} Lots ($100 Risk)\n\n"
                                            f"🛡️ *Rule:* At {last_bar['Close'] + (risk*1.5):.2f}, move SL to {last_bar['Close'] - (risk*0.75):.2f}")
                                     
                                     send_telegram_msg(msg)
-                                    last_alert_bar = current_time
-                                    print(f"🔔 ALERT SENT: {current_time}")
-                                
+                                    last_alerts[sym] = t
+                                    
         except Exception as e:
             print(f"Error: {e}")
             
-        time.sleep(60) # Re-check every 60 seconds
+        time.sleep(60)
 
 if __name__ == "__main__":
     monitor()
